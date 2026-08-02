@@ -116,6 +116,7 @@ RELATIONS = (
 _SHA256_CACHE = {}
 CALIBRATION_CACHE_VERSION = 1
 PROBE_CACHE_VERSION = 2
+METRIC_VERSION = "official-rgbd-v2-iqr-snn-2"
 
 
 class AuditError(RuntimeError):
@@ -831,16 +832,21 @@ def _rgb_signature(image):
     return cv2.resize(np.asarray(image), (32, 32), interpolation=cv2.INTER_AREA).astype(np.uint8)
 
 
-def _encoded_signatures(encoded: list[bytes]):
+def decode_official_rgb(encoded: bytes):
+    """Decode a precollected JPEG into top-down RGB array order."""
     import cv2
     import numpy as np
 
+    image = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise AuditError("official RGB JPEG cannot be decoded")
+    return np.ascontiguousarray(np.flipud(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
+
+
+def _encoded_signatures(encoded: list[bytes]):
     result = []
     for index in (0, len(encoded) // 2, len(encoded) - 1):
-        image = cv2.imdecode(np.frombuffer(encoded[index], np.uint8), cv2.IMREAD_COLOR)
-        if image is None:
-            raise AuditError("official RGB JPEG cannot be decoded for disambiguation")
-        result.append(_rgb_signature(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
+        result.append(_rgb_signature(decode_official_rgb(encoded[index])))
     return result
 
 
@@ -862,11 +868,7 @@ def official_record(features: dict, raw: bytes, member: dict, ordinal: int, reco
     states = np.asarray(features["steps/observation/state"], dtype="<f4").reshape(-1, 8)
     if len(actions) != len(states) or len(actions) != len(features["steps/observation/image"]):
         raise AuditError("official record action/state/image lengths differ")
-    rgb_bytes = features["steps/observation/image"][0]
-    rgb = cv2.imdecode(np.frombuffer(rgb_bytes, np.uint8), cv2.IMREAD_COLOR)
-    if rgb is None:
-        raise AuditError("official RGB JPEG cannot be decoded")
-    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+    rgb = decode_official_rgb(features["steps/observation/image"][0])
     mask = None
     if "steps/observation/segmentation" in features:
         mask = cv2.imdecode(
@@ -875,7 +877,7 @@ def official_record(features: dict, raw: bytes, member: dict, ordinal: int, reco
         )
         if mask is None:
             raise AuditError("official segmentation PNG cannot be decoded")
-        mask = np.squeeze(mask).astype(np.uint8)
+        mask = np.ascontiguousarray(np.flipud(np.squeeze(mask))).astype(np.uint8)
     object_map = {}
     if "steps/obj_name_to_seg_id" in features:
         object_map = json.loads(features["steps/obj_name_to_seg_id"][0])
@@ -1042,6 +1044,8 @@ def _write_official_references(output: Path, rows: list[dict]) -> None:
     with h5py.File(partial, "w") as handle:
         handle.attrs["version"] = 2
         handle.attrs["count"] = len(rows)
+        handle.attrs["frame_order"] = "top-down"
+        handle.attrs["raw_jpeg_frame_order"] = "MuJoCo bottom-up"
         for row in rows:
             record = row["_record"]
             group = handle.create_group(row["reference_id"])
@@ -1966,8 +1970,22 @@ def manifest(args) -> None:
                     raise AuditError(f"{suite}/{setting}/slot{slot}: candidate pool has {len(candidates)} != 8")
                 cache_key = f"{suite}/{setting}/{slot}"
                 slot_legality = legality.get(cache_key, {})
+                candidate_cache_context = (
+                    (*cache_context, METRIC_VERSION) if setting == "camera" else cache_context
+                )
+                reference_fingerprint = sha256_bytes(
+                    canonical_json(references[(suite, setting)]).encode()
+                )
                 fingerprint = sha256_bytes(
-                    canonical_json((cache_context, candidates, slot_legality)).encode()
+                    canonical_json(
+                        (
+                            METRIC_VERSION,
+                            candidate_cache_context,
+                            reference_fingerprint,
+                            candidates,
+                            slot_legality,
+                        )
+                    ).encode()
                 )
                 cached = probe_cache.get(cache_key)
                 if cached and cached.get("fingerprint") == fingerprint:
@@ -1986,7 +2004,7 @@ def manifest(args) -> None:
                         args.gpu,
                         candidate_cache,
                         candidate_cache_path,
-                        cache_context,
+                        candidate_cache_context,
                         slot_legality,
                     )
                     probe_cache[cache_key] = {
@@ -2850,7 +2868,7 @@ def load_reference_features(output: Path, audit_data: dict, gpu: int, languages:
     if deficient:
         report = {
             "decision": "NO-GO",
-            "metric_version": "official-rgbd-v2-iqr-snn-1",
+            "metric_version": METRIC_VERSION,
             "blocker": "official RLDS language references preserve fewer than three distinct calibration targets",
             "language_text_diversity": language_diversity,
             "official_references": len(mappings),
@@ -2942,14 +2960,86 @@ def load_reference_features(output: Path, audit_data: dict, gpu: int, languages:
     return compact
 
 
+def official_camera_pose(matrix):
+    """Convert the archive's raw MuJoCo camera axes to robosuite's convention."""
+    import numpy as np
+
+    matrix = np.asarray(matrix, dtype=float).copy()
+    if matrix.shape != (4, 4):
+        raise AuditError("official camera extrinsics must be 4x4")
+    matrix[:3, 1:3] *= -1
+    return matrix
+
+
+def camera_pose_from_xml(source_xml: str, params: dict):
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    camera = next(
+        (element for element in ET.fromstring(source_xml).iter("camera") if element.get("name") == "agentview"),
+        None,
+    )
+    if camera is None or camera.get("pos") is None or camera.get("quat") is None:
+        raise AuditError("source XML lacks a fixed agentview camera pose")
+    position = np.asarray(list(map(float, camera.get("pos").split())))
+    quaternion = list(map(float, camera.get("quat").split()))
+
+    def rotate(axis, degrees, move_position=True):
+        nonlocal position, quaternion
+        turn = Rotation.from_rotvec(np.radians(degrees) * np.asarray(axis))
+        current = Rotation.from_quat([quaternion[1], quaternion[2], quaternion[3], quaternion[0]])
+        quaternion_xyzw = (turn * current).as_quat()
+        quaternion = [
+            round(float(quaternion_xyzw[3]), 4),
+            *[round(float(value), 4) for value in quaternion_xyzw[:3]],
+        ]
+        if move_position:
+            pivot = np.array([0.0, 0.0, 0.8]) if axis[1] else np.zeros(3)
+            position = np.asarray(
+                [round(float(value), 4) for value in turn.apply(position - pivot) + pivot]
+            )
+
+    if params["vertical"]:
+        rotate((0, 1, 0), -params["vertical"])
+    rotate((0, 0, 1), params["horizontal"])
+    if params["scale"] != 1:
+        position = np.asarray(
+            [
+                round(float(value), 4)
+                for value in np.array([0.0, 0.0, 0.8])
+                + (position - np.array([0.0, 0.0, 0.8])) * params["scale"]
+            ]
+        )
+    if params["endpoint_horizontal"]:
+        rotate((0, 0, 1), params["endpoint_horizontal"], move_position=False)
+    if params["endpoint_vertical"]:
+        rotate((0, 1, 0), -params["endpoint_vertical"], move_position=False)
+
+    matrix = np.eye(4)
+    matrix[:3, :3] = Rotation.from_quat(
+        [quaternion[1], quaternion[2], quaternion[3], quaternion[0]]
+    ).as_matrix() @ np.diag([1, -1, -1])
+    matrix[:3, 3] = position
+    return matrix
+
+
 def _pose_feature(matrix, default) -> dict:
     import numpy as np
 
     matrix, default = np.asarray(matrix), np.asarray(default)
     delta = default[:3, :3].T @ matrix[:3, :3]
     angle = math.acos(float(np.clip((np.trace(delta) - 1) / 2, -1, 1)))
-    translation = float(np.linalg.norm(matrix[:3, 3] - default[:3, 3]))
-    return {"numeric": [angle, translation], "categories": []}
+    translation = matrix[:3, 3] - default[:3, 3]
+    if angle < 1e-8:
+        rotation = np.zeros(3)
+    else:
+        rotation = angle / (2 * math.sin(angle)) * np.array(
+            [delta[2, 1] - delta[1, 2], delta[0, 2] - delta[2, 0], delta[1, 0] - delta[0, 1]]
+        )
+    return {
+        "numeric": [angle, float(np.linalg.norm(translation)), *rotation, *translation],
+        "categories": [],
+    }
 
 
 def _medoids(features: list[dict], count: int) -> list[int]:
@@ -2969,7 +3059,7 @@ def _reference_targets(setting: str, references: list[dict], default_pose=None) 
     calibration = [item for item in references if item["split"] == "calibration"]
     if setting == "camera":
         for item in references:
-            item["feature"] = _pose_feature(item["extrinsics"], default_pose)
+            item["feature"] = _pose_feature(official_camera_pose(item["extrinsics"]), default_pose)
     features = [item["feature"] for item in calibration]
     if setting == "objects":
         targets = [
@@ -3026,6 +3116,13 @@ def _candidate_row(selected: dict, source: dict, suite: str, setting: str, slot:
     }
 
 
+def rescore_probe(probe: dict, target: dict, calibration: list[dict]) -> dict:
+    probe = dict(probe)
+    if probe["status"] == "valid":
+        probe["loss"] = feature_distance(probe["feature"], target, calibration)
+    return probe
+
+
 def calibrate_candidates(
     output: Path,
     audit_data: dict,
@@ -3071,9 +3168,7 @@ def calibrate_candidates(
                     "endpoint_vertical": 0,
                 },
             )
-            default_pose = probe_observation(
-                baseline, output, gpu, camera_only=True, source=source_episode
-            )["extrinsics"]
+            default_pose = camera_pose_from_xml(source_episode["source_xml_processed"], baseline["randomization"])
         targets, calibration_features = _reference_targets(
             setting, references[(suite, setting)], default_pose
         )
@@ -3099,9 +3194,9 @@ def calibrate_candidates(
                     if setting == "language":
                         feature = language_feature(row["randomization"]["instruction"])
                     elif setting == "camera":
-                        matrix = probe_observation(
-                            row, output, gpu, camera_only=True, source=source_episode
-                        )["extrinsics"]
+                        matrix = camera_pose_from_xml(
+                            source_episode["source_xml_processed"], row["randomization"]
+                        )
                         feature = _pose_feature(matrix, default_pose)
                     elif setting == "noise":
                         timestep = int(next(index for index, value in enumerate(row["keep_mask"]) if value))
@@ -3129,12 +3224,10 @@ def calibrate_candidates(
                             extra_objects=row["randomization"].get("extra_objects", 0),
                             categories=categories,
                         )
-                    loss = feature_distance(feature, target["feature"], calibration_features)
                     probe = {
                         "candidate_id": row["randomization"]["candidate_id"],
                         "status": "valid",
                         "feature": feature,
-                        "loss": loss,
                         "row": row,
                     }
                 except Exception as error:
@@ -3149,6 +3242,7 @@ def calibrate_candidates(
                         "probe": probe,
                     }
                     atomic_json(candidate_cache_path, candidate_cache)
+            probe = rescore_probe(probe, target["feature"], calibration_features)
             verdict = legality.get(probe["candidate_id"])
             if verdict and verdict.get("legal") is False:
                 probe = {
@@ -3165,7 +3259,7 @@ def calibrate_candidates(
         raise AuditError(f"{suite}/{setting}/slot{slot}: only {len(valid)} legal calibration probes")
     reference_rows = references[(suite, setting)]
     metadata = {
-        "metric_version": "official-rgbd-v2-iqr-snn-1",
+        "metric_version": METRIC_VERSION,
         "reference_ids": [item["reference_id"] for item in reference_rows if item["split"] == "calibration"],
         "holdout_reference_ids": [item["reference_id"] for item in reference_rows if item["split"] == "holdout"],
         "official_reference_count": len(reference_rows),
@@ -4002,7 +4096,7 @@ def calibration_metrics(output: Path, episodes: dict, errors: list[str]) -> dict
                 errors.append(f"{setting}: inconsistent feature for {reference_id}")
             references[setting][reference_id] = value
 
-    report = {"metric_version": "official-rgbd-v2-iqr-snn-1", "settings": {}}
+    report = {"metric_version": METRIC_VERSION, "settings": {}}
     for setting in SETTINGS:
         calibration = [
             item["feature"] for item in references[setting].values() if item["split"] == "calibration"
@@ -4103,7 +4197,6 @@ def validate(args) -> None:
     deterministic = {"run": not args.skip_determinism, "matched": 0, "expected": 6}
     if not args.skip_determinism and set(episodes) == expected_keys:
         configure_libero(output)
-        runtime = json.loads((output / "runtime.json").read_text())
         (output / "reports").mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=output / "reports") as temporary:
             temporary = Path(temporary)
@@ -4111,6 +4204,7 @@ def validate(args) -> None:
                 original = Path(episodes[(SUITES[0], setting, 1)]["path"])
                 with h5py.File(original, "r") as handle:
                     row = json.loads(decoded_dataset(handle["metadata/manifest_json"]))
+                    runtime = json.loads(decoded_dataset(handle["metadata/runtime_json"]))
                 rerun = run_attempt_isolated(row, temporary, runtime, args.gpu)
                 if h5_content_hash(original) == h5_content_hash(Path(rerun["path"])):
                     deterministic["matched"] += 1

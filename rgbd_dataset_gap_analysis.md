@@ -2,7 +2,7 @@
 
 ## 结论
 
-v1 的 72 条 success-selected RGB-D 样例已通过工程验证（GO）。v2 已恢复 192 条官方参考的唯一映射，冻结 216 次尝试并生成 72 条 HDF5、24 个预览；完整验证和 6/6 确定性复跑均通过，结论为 **GO**。v1 文件未被修改。
+v1 的 72 条 success-selected RGB-D 样例已通过工程验证（GO）。v2 已恢复 192 条官方参考的唯一映射，冻结 216 次尝试并生成 72 条 HDF5、24 个预览；完整验证和 6/6 确定性复跑均通过，结论为 **GO**。另生成了 6 条 action 指纹完全相同、逐 action index 对齐的 Mirror / 官方对比视频。v1 文件未被修改。
 
 因此，v2 证明固定归档连接、有限参考校准和 RGB-D 生成管线可闭环，但 72 条 success-selected 样例仍不等于复现完整官方训练分布。Depth 仍没有官方真值。
 
@@ -16,7 +16,8 @@ v1 的 72 条 success-selected RGB-D 样例已通过工程验证（GO）。v2 �
 | Calibration / holdout | 144 / 48 | 每个 `task × setting` 稳定 6/2 切分，组内 logical episode 无泄漏 |
 | Action / state 最大误差 | `0 / 0` | 全部满足 `≤1e-6` |
 | TFRecord CRC | 192/192 | 全部通过 |
-| 映射置信度 | 192 条 high | revision、volume、member、record、raw/frame hash 均可追踪 |
+| 官方帧顺序 | 192/192 已归一化为 top-down | raw JPEG/mask 的 MuJoCo bottom-up 顺序仅在解码后翻转，raw/frame hash 不变；修复后 8 个槽的最终候选改变并已重建 |
+| 映射置信度 | 168 条 high、24 条 medium | 24 条 Language 参考因跨任务补足而降级；全部 revision、volume、member、record、raw/frame hash 仍可追踪 |
 | 扫描范围 | Camera 256；Segmentation 1024 shards | 使用本地完整归档；没有建立 14,347 条持久索引 |
 | Calibration probes / attempts | 576 / 216 | 每槽 8 个 probe，冻结最低 loss 的 3 次 retry |
 | v2 HDF5 / 预览 | 72 / 24 | 4 suites × 6 settings × 3 slots，覆盖完整 |
@@ -27,14 +28,48 @@ v1 的 72 条 success-selected RGB-D 样例已通过工程验证（GO）。v2 �
 
 | Setting | 样例 | 官方参考（calibration/holdout） | Calibration loss | Holdout loss | 置信度 |
 |---|---:|---:|---:|---:|---|
-| Objects | 12 | 32（24/8） | 0.894728 | 0.898675 | high |
-| Background | 12 | 32（24/8） | 12.9945 | 12.6502 | high |
-| Light | 12 | 32（24/8） | 0.116396 | 0.254526 | high |
-| Camera | 12 | 32（24/8） | 4.89106 | 4.94660 | high |
+| Objects | 12 | 32（24/8） | 0.806206 | 0.812119 | high |
+| Background | 12 | 32（24/8） | 12.9918 | 12.6488 | high |
+| Light | 12 | 32（24/8） | 0.115685 | 0.253766 | high |
+| Camera | 12 | 32（24/8） | 0.390672 | 0.470594 | high |
 | Language | 12 | 32（24/8） | 97222.2 | 97222.2 | medium |
-| Noise | 12 | 32（24/8） | 0.742547 | 0.782892 | high |
+| Noise | 12 | 32（24/8） | 0.643494 | 0.620369 | high |
 
 机器可读映射见 [`reference_mapping.jsonl`](data/libero_plus_rgbd_sample_v2/evidence/reference_mapping.jsonl)，参考内容见 [`official_references.hdf5`](data/libero_plus_rgbd_sample_v2/evidence/official_references.hdf5)，数值结果见 [`calibration.json`](data/libero_plus_rgbd_sample_v2/reports/calibration.json)，最终验收见 [`validation.json`](data/libero_plus_rgbd_sample_v2/reports/validation.json) 和 [`gap_report.md`](data/libero_plus_rgbd_sample_v2/reports/gap_report.md)。
+
+## v2 与官方数据集的逐项差异
+
+下表中的“官方数据”指固定 revision 的 RLDS、Camera 和 Segmentation 归档；“v2 Mirror”指本次生成的 72 条 RGB-D 样例。192 条参考只覆盖 4 个代表任务，不代表全部 14,347 条官方 episode。各类 loss 使用不同特征空间，只能在同一 setting、同一 metric version 内解释，不能横向比较大小，也没有“足够接近官方”的通过阈值。
+
+| 差异 | v2 Mirror 当前能保证什么 | 与官方数据仍有何不同或缺少什么 | 当前结论 |
+|---|---|---|---|
+| Front RGB | Mirror 与官方归档均保存完整的 `256×256` front RGB；官方解码入口统一把 RGB 和 mask 从 MuJoCo bottom-up framebuffer 顺序翻为 top-down，再用于 reference feature；6 条视频另行使用相同 action 指纹并逐 index 对齐 | 校准本身是集合级特征近邻，不是逐像素拟合；官方 texture、seed 和渲染参数未公开。raw/frame hash 始终取翻转前的归档字节 | 可以比较有限参考上的特征分布和相同控制轨迹的画面，不能声称逐像素复刻 |
+| Wrist RGB | Mirror 与官方归档都包含完整 wrist RGB；Mirror 还保存逐帧 wrist 内外参和米制 depth；对比视频按与 front 相同的 action index 展示 wrist | 当前 calibration/loss 没有使用 wrist RGB；官方归档没有 wrist depth，也没有可直接核验的 wrist extrinsics。视频同样只对官方 bottom-up JPEG 做展示翻转 | 可以做同步定性比较，但没有官方 wrist 数值 gap |
+| Compounding Objects | 官方 Segmentation 参考包含实例 mask 和 object map；Mirror 固定 1/2/3 个额外对象槽，并按额外对象数、类别 Jaccard、mask 面积和质心选择候选 | Mirror 使用本地 BDDL 候选及可成功 replay 的放置；没有恢复官方逐 episode 对象 ID、pose、placement seed 或失败放置 | Calibration / holdout loss 为 `0.806206 / 0.812119`；这是 top-down mask 特征级近邻，不是对象配置复原 |
+| Background | Mirror 用前景补集的 RGB histogram、亮度和多尺度 Sobel 特征，从 calibration pool 选择 3 个 medoid | 没有官方逐 episode texture/material 参数、资产 ID、UV、seed；Mirror medoid 也不是对应官方 episode 的原始背景 | Loss 为 `12.9918 / 12.6488`；已量化有限参考差异，但不能恢复官方纹理生成过程 |
+| Light | Mirror 用亮度、色度/CCT、阴影和高光比例选择 25/50/75 分位候选，并保存实际模型 XML | 官方 Light 归档提供 RGB 和 setting 路径，但不提供逐 episode 光源位置、颜色、强度或 seed | Loss 为 `0.115685 / 0.253766`；只覆盖画面统计，不等于光源参数一致 |
+| Camera | 官方 Camera 参考提供 primary-camera extrinsics；读取时已把原始 MuJoCo camera axes 转为 robosuite/OpenCV 约定，pose 特征保留有符号旋转向量和位移向量；Mirror 保存逐帧 front/wrist 外参 | 官方没有对应 wrist extrinsics；Mirror 只能从 8 个冻结候选中逼近，不能复用未公开的逐 episode camera 参数。相同 action 的代表视频仍有 `4.24665° / 0.154755 m` front pose residual | 修复后 loss 为 `0.390672 / 0.470594`；旧值 `4.89106 / 4.94660` 来自坐标轴约定错误，已作废 |
+| Language | Mirror rewrite 通过实体、目标、动作和空间关系硬校验，并保存固定 Qwen revision、prompt 与 tokenizer hash；代表视频改为相同任务和相同 action | 官方公开记录在单任务内基本只有 canonical instruction；为构造不同目标，32 条 Language calibration 参考中仍有 24 条跨任务补足 | Loss 为 `97222.2 / 97222.2`、confidence 为 medium；这是最弱的一类证据，不代表恢复了官方 rewrite 原句或生成过程 |
+| Sensor Noise | Mirror 保存算法、severity、参数、seed 和 clean front RGB；官方 noisy RGB 与 clean replay 均先统一为 top-down，再计算 Laplacian、频谱、对比度和残差特征 | 官方 Noise 记录没有噪声算法、参数、seed 或配对 clean frame；官方 clean 对照由匹配 LIBERO replay 重建。Mirror 只对 front RGB 加噪，wrist 保持 clean | Loss 为 `0.643494 / 0.620369`；只量化观测效果，不恢复官方噪声机制或作用范围 |
+| Action / state / trajectory | 192 条参考与 LeRobot 的 float32 action/state 最大误差均为 `0`；Mirror 完整执行 source actions，仅按 keep mask 保存 post-step observation。6 条视频额外要求任务、setting、action 长度及 float32 bytes SHA-256 全部相同，且 frame `i` 同时取两侧 action index `i` | 相同 action-defined trajectory 不会使随机化资产、渲染参数或相机 pose 自动相同；官方不同导出 episode index 也可能复用同一 action 指纹 | 视频现在确实反映同一控制 episode，可用于同步观察视觉差异；不能把像素差全归因于动作 |
+| 成功轨迹组成 | 72 个 Mirror slot 均有冻结 manifest、候选、seed 和成功 HDF5；实际生成账本为 72 成功、0 失败 | 官方失败 attempts、成功筛选逻辑和逐类成功率未公开；本次又只保留成功结果 | 不能由 72/72 推断官方或生成器的自然成功率 |
+| Depth | Mirror 保存 front/wrist 米制 depth、valid mask、near/far 和相机矩阵，几何验证通过 | 三类官方归档均没有 depth 字段或 depth 标定真值 | 不存在官方 depth loss；Mirror depth 只能证明内部几何自洽 |
+| 数据集比例与任务覆盖 | Mirror 固定 4 suites × 6 settings × 3 slots；每 setting 恰好 12 条，参考池每 setting 恰好 32 条 | 官方数据覆盖 40 个任务和 14,347 条 episode，真实 setting、任务、成功/失败比例没有被 Mirror 保留 | 当前结果是平衡样例集，不是官方训练分布的等比例镜像 |
+
+## v2 Mirror / 官方代表性对比视频
+
+左列直接读取 v2 Mirror HDF5，右列直接读取固定 revision 的 LIBERO-Plus precollected TFRecord；上下分别为 front 和 wrist。每一对都同时满足任务、setting、action 长度和 `SHA256(contiguous little-endian float32 action bytes)` 相同，最大 action 误差为 `0`。视频保留全部 action timestep，frame `i` 在两侧都对应 action index `i`，不再使用归一化进度。官方 JPEG 按与 reference feature 相同的解码规则做竖直翻转，以纠正 MuJoCo bottom-up framebuffer 顺序。
+
+| Setting | Mirror episode | 对比视频 | 官方记录 | Action 证据 |
+|---|---|---|---|---|
+| Objects | `libero_goal__objects__slot3` | [`same_action.mp4`](data/libero_plus_rgbd_sample_v2/comparisons/libero_goal__objects__slot3__same_action.mp4) | `ref-25c5ce9404d54f922903` | 107 帧；`9bf695468fb9…`；max error `0` |
+| Background | `libero_spatial__background__slot1` | [`same_action.mp4`](data/libero_plus_rgbd_sample_v2/comparisons/libero_spatial__background__slot1__same_action.mp4) | `ref-ba50a9ee54495267de08` | 127 帧；`fdc0170ec83b…`；max error `0` |
+| Light | `libero_10__light__slot1` | [`same_action.mp4`](data/libero_plus_rgbd_sample_v2/comparisons/libero_10__light__slot1__same_action.mp4) | Segmentation shard 15 / record 0 | 254 帧；`c80f5afb78c2…`；max error `0` |
+| Camera | `libero_spatial__camera__slot1` | [`same_action.mp4`](data/libero_plus_rgbd_sample_v2/comparisons/libero_spatial__camera__slot1__same_action.mp4) | `ref-c3fdc78763ebcdb4573b` | 127 帧；`fdc0170ec83b…`；max error `0` |
+| Language | `libero_spatial__language__slot2` | [`same_action.mp4`](data/libero_plus_rgbd_sample_v2/comparisons/libero_spatial__language__slot2__same_action.mp4) | `ref-e2d64b31e462a6067f91` | 133 帧；`9c0249deb6a0…`；max error `0` |
+| Noise | `libero_spatial__noise__slot2` | [`same_action.mp4`](data/libero_plus_rgbd_sample_v2/comparisons/libero_spatial__noise__slot2__same_action.mp4) | `ref-5ae8afb6bcf225858d04` | 133 帧；`9c0249deb6a0…`；max error `0` |
+
+其中 5 条直接复用 192 条审计参考；Light 的 192 条抽样参考里没有相同 action，因此从已下载的固定 Segmentation 归档按任务和 action 指纹扫描得到，不把不匹配的 reference 硬凑进视频。其 archive revision、LFS hash、member CRC、record ordinal/offset、raw/frame hash 和 MP4 SHA-256 均见 [`comparison_manifest.json`](data/libero_plus_rgbd_sample_v2/comparisons/comparison_manifest.json)。
 
 ## v1 已验证结果
 

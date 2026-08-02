@@ -11,6 +11,12 @@ SCRIPT = Path(__file__).parents[1] / "scripts/create_rgbd_samples.py"
 SPEC = importlib.util.spec_from_file_location("create_rgbd_samples", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+COMPARISON_SCRIPT = Path(__file__).parents[1] / "scripts/create_rgbd_comparisons.py"
+COMPARISON_SPEC = importlib.util.spec_from_file_location(
+    "create_rgbd_comparisons", COMPARISON_SCRIPT
+)
+COMPARISON = importlib.util.module_from_spec(COMPARISON_SPEC)
+COMPARISON_SPEC.loader.exec_module(COMPARISON)
 
 
 class SampleProtocolTest(unittest.TestCase):
@@ -138,7 +144,88 @@ class SampleProtocolTest(unittest.TestCase):
             {"candidate_id": "c", "status": "invalid", "loss": 0.0},
         ]
         self.assertEqual([row["candidate_id"] for row in MODULE.rank_probes(probes)], ["a", "b"])
+        rescored = MODULE.rescore_probe(
+            {"candidate_id": "cached", "status": "valid", "loss": 999, "feature": {"numeric": [1], "categories": []}},
+            {"numeric": [2], "categories": []},
+            [{"numeric": [0], "categories": []}, {"numeric": [4], "categories": []}],
+        )
+        self.assertNotEqual(rescored["loss"], 999)
         self.assertNotIn("unavailable", inspect.getsource(MODULE.write_gap_report))
+
+    def test_official_camera_axes_and_signed_pose_feature(self):
+        angle = np.deg2rad(30)
+        positive = np.eye(4)
+        positive[:3, :3] = [
+            [np.cos(angle), -np.sin(angle), 0],
+            [np.sin(angle), np.cos(angle), 0],
+            [0, 0, 1],
+        ]
+        positive[1, 3] = 0.3
+        raw_official = positive.copy()
+        raw_official[:3, 1:3] *= -1
+        self.assertTrue(np.allclose(MODULE.official_camera_pose(raw_official), positive))
+
+        negative = np.eye(4)
+        negative[:3, :3] = positive[:3, :3].T
+        negative[1, 3] = -0.3
+        positive_feature = MODULE._pose_feature(positive, np.eye(4))["numeric"]
+        negative_feature = MODULE._pose_feature(negative, np.eye(4))["numeric"]
+        self.assertAlmostEqual(positive_feature[0], negative_feature[0])
+        self.assertAlmostEqual(positive_feature[1], negative_feature[1])
+        self.assertFalse(np.allclose(positive_feature[2:], negative_feature[2:]))
+
+        pose = MODULE.camera_pose_from_xml(
+            '<mujoco><worldbody><camera name="agentview" pos="1 0 1" quat="1 0 0 0"/></worldbody></mujoco>',
+            {
+                "horizontal": 90,
+                "vertical": 0,
+                "scale": 1,
+                "endpoint_horizontal": 0,
+                "endpoint_vertical": 0,
+            },
+        )
+        self.assertTrue(np.allclose(pose[:3, 3], [0, 1, 1]))
+        self.assertTrue(
+            np.allclose(
+                pose[:3, :3],
+                np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]) @ np.diag([1, -1, -1]),
+                atol=1e-4,
+            )
+        )
+
+    def test_comparison_requires_the_same_action_fingerprint(self):
+        actions = np.arange(21, dtype=np.float32).reshape(3, 7)
+        self.assertEqual(COMPARISON.exact_action_error(actions, actions.astype(np.float64)), 0)
+        changed = actions.copy()
+        changed[1, 2] += 1
+        with self.assertRaisesRegex(COMPARISON.base.AuditError, "same float32 fingerprint"):
+            COMPARISON.exact_action_error(actions, changed)
+
+        mirror = {
+            "setting": "camera",
+            "suite": "libero_spatial",
+            "variant_slot": 1,
+            "task": "task",
+            "action_key": MODULE.action_key(actions),
+        }
+        wrong = {
+            "setting": "camera",
+            "suite": "libero_spatial",
+            "mapped_task": "task",
+            "action_length": 3,
+            "action_sha256": MODULE.action_key(changed)[1],
+            "reference_id": "wrong",
+        }
+        exact = {**wrong, "action_sha256": MODULE.action_key(actions)[1], "reference_id": "exact"}
+        selected = COMPARISON.select_reference_matches([mirror], [wrong, exact])
+        self.assertEqual(selected["camera"][1]["reference_id"], "exact")
+
+        import cv2
+
+        rgb = np.array([[[255, 0, 0]], [[0, 0, 255]]], dtype=np.uint8)
+        ok, encoded = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        self.assertTrue(ok)
+        self.assertTrue(np.array_equal(COMPARISON.decode_rgb(encoded.tobytes()), rgb[::-1]))
 
     def test_manifest_rejects_non_diverse_official_language_before_replay(self):
         import h5py
