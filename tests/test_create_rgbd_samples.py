@@ -222,10 +222,16 @@ class SampleProtocolTest(unittest.TestCase):
 
         import cv2
 
-        rgb = np.array([[[255, 0, 0]], [[0, 0, 255]]], dtype=np.uint8)
+        rgb = np.array(
+            [
+                [[255, 0, 0], [0, 255, 0]],
+                [[0, 0, 255], [255, 255, 0]],
+            ],
+            dtype=np.uint8,
+        )
         ok, encoded = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
         self.assertTrue(ok)
-        self.assertTrue(np.array_equal(COMPARISON.decode_rgb(encoded.tobytes()), rgb[::-1]))
+        self.assertTrue(np.array_equal(COMPARISON.decode_rgb(encoded.tobytes()), rgb[::-1, ::-1]))
 
     def test_manifest_rejects_non_diverse_official_language_before_replay(self):
         import h5py

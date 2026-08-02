@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create action-identical Mirror / LIBERO-Plus precollected comparisons."""
+"""Create action-identical replica / LIBERO-Plus precollected comparisons."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def load_mirrors(output: Path) -> list[dict]:
                 }
             )
     if len(mirrors) != 72:
-        raise base.AuditError(f"comparison requires 72 Mirror episodes, found {len(mirrors)}")
+        raise base.AuditError(f"comparison requires 72 replica episodes, found {len(mirrors)}")
     return mirrors
 
 
@@ -162,7 +162,7 @@ def scan_exact_record(
         if mirror["setting"] == setting:
             targets.setdefault((mirror["task_stem"].lower(), mirror["action_key"]), []).append(mirror)
     if not targets:
-        raise base.AuditError(f"no Mirror target exists for {setting}")
+        raise base.AuditError(f"no replica target exists for {setting}")
 
     for shard in range(base.ARCHIVES[archive.source]["shards"]):
         if shard % 32 == 0:
@@ -279,7 +279,7 @@ def render_video(output: Path, mirror: dict, official: dict, fps: int) -> dict:
 
     with h5py.File(mirror["path"], "r") as handle:
         if len(handle["actions"]) != length:
-            raise base.AuditError("Mirror image/action lengths differ")
+            raise base.AuditError("replica image/action lengths differ")
         if mirror["setting"] == "camera" and features.get(
             "episode_metadata/camera_calibration/primary_cam_extrinsics"
         ):
@@ -305,14 +305,14 @@ def render_video(output: Path, mirror: dict, official: dict, fps: int) -> dict:
         try:
             for index in range(length):
                 canvas = np.full((640, 1024, 3), 24, dtype=np.uint8)
-                canvas[:320, :320] = panel(handle["observations/front_rgb"][index], "MIRROR front")
-                canvas[:320, 320:640] = panel(decode_rgb(front[index]), "LIBERO-PLUS front")
-                canvas[320:, :320] = panel(handle["observations/wrist_rgb"][index], "MIRROR wrist")
-                canvas[320:, 320:640] = panel(decode_rgb(wrist[index]), "LIBERO-PLUS wrist")
+                canvas[:320, :320] = panel(handle["observations/front_rgb"][index], "REPLICA front")
+                canvas[:320, 320:640] = panel(decode_rgb(front[index]), "OFFICIAL front")
+                canvas[320:, :320] = panel(handle["observations/wrist_rgb"][index], "REPLICA wrist")
+                canvas[320:, 320:640] = panel(decode_rgb(wrist[index]), "OFFICIAL wrist")
                 lines = [
                     (mirror["setting"].upper(), (98, 203, 255)),
                     (
-                        f"Mirror: {mirror['suite']} / slot{mirror['variant_slot']} / {mirror['episode_id']}",
+                        f"Replica: {mirror['suite']} / slot{mirror['variant_slot']} / {mirror['episode_id']}",
                         (235, 235, 235),
                     ),
                     (f"Official: {mapping.get('reference_id', 'archive scan')}", (235, 235, 235)),
@@ -355,7 +355,7 @@ def render_video(output: Path, mirror: dict, official: dict, fps: int) -> dict:
         "mirror_hdf5_sha256": base.sha256_file(mirror["path"]),
         "mirror_task": mirror["task"],
         "official_dataset": "LIBERO-Plus precollected",
-        "official_display_transform": "vertical flip from MuJoCo framebuffer order",
+        "official_display_transform": "rotate archived JPEG 180 degrees",
         "official_selection": official["selection"],
         "official_reference_id": mapping.get("reference_id"),
         "official_logical_episode": mapping.get("logical_episode"),
@@ -411,10 +411,10 @@ def main() -> None:
         print(json.dumps({"comparison": setting, "video": rows[-1]["video"]}), flush=True)
     manifest = {
         "version": 2,
-        "layout": "left Mirror dataset; right LIBERO-Plus precollected; front above wrist",
+        "layout": "left local replica; right LIBERO-Plus precollected; front above wrist",
         "pairing": "task + setting + (action length, SHA-256 of contiguous little-endian float32 bytes)",
         "sampling": "every action index; no normalized-progress alignment",
-        "official_display_transform": "vertical flip from MuJoCo framebuffer order",
+        "official_display_transform": "rotate archived JPEG 180 degrees",
         "rows": rows,
     }
     base.atomic_json(output / "comparisons/comparison_manifest.json", manifest)

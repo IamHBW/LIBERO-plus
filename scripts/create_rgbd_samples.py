@@ -116,7 +116,7 @@ RELATIONS = (
 _SHA256_CACHE = {}
 CALIBRATION_CACHE_VERSION = 1
 PROBE_CACHE_VERSION = 2
-METRIC_VERSION = "official-rgbd-v2-iqr-snn-2"
+METRIC_VERSION = "official-rgbd-v2-iqr-snn-3"
 
 
 class AuditError(RuntimeError):
@@ -833,14 +833,14 @@ def _rgb_signature(image):
 
 
 def decode_official_rgb(encoded: bytes):
-    """Decode a precollected JPEG into top-down RGB array order."""
+    """Decode a precollected JPEG into the replica renderer's orientation."""
     import cv2
     import numpy as np
 
     image = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise AuditError("official RGB JPEG cannot be decoded")
-    return np.ascontiguousarray(np.flipud(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
+    return np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)[::-1, ::-1])
 
 
 def _encoded_signatures(encoded: list[bytes]):
@@ -877,7 +877,7 @@ def official_record(features: dict, raw: bytes, member: dict, ordinal: int, reco
         )
         if mask is None:
             raise AuditError("official segmentation PNG cannot be decoded")
-        mask = np.ascontiguousarray(np.flipud(np.squeeze(mask))).astype(np.uint8)
+        mask = np.ascontiguousarray(np.squeeze(mask)[::-1, ::-1]).astype(np.uint8)
     object_map = {}
     if "steps/obj_name_to_seg_id" in features:
         object_map = json.loads(features["steps/obj_name_to_seg_id"][0])
@@ -1044,8 +1044,8 @@ def _write_official_references(output: Path, rows: list[dict]) -> None:
     with h5py.File(partial, "w") as handle:
         handle.attrs["version"] = 2
         handle.attrs["count"] = len(rows)
-        handle.attrs["frame_order"] = "top-down"
-        handle.attrs["raw_jpeg_frame_order"] = "MuJoCo bottom-up"
+        handle.attrs["frame_order"] = "replica-aligned"
+        handle.attrs["raw_jpeg_transform"] = "rotate 180 degrees"
         for row in rows:
             record = row["_record"]
             group = handle.create_group(row["reference_id"])
