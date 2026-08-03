@@ -16,3 +16,4 @@ custom_pddl/
 libero.egg-info/
 .vscode/
 libero/libero/assets/
+data/*
