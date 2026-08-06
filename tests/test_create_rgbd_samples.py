@@ -1,283 +1,332 @@
+import argparse
 import importlib.util
-import inspect
+import json
 from pathlib import Path
-import struct
+import tempfile
 import unittest
+from unittest import mock
 
+import h5py
 import numpy as np
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts/create_rgbd_samples.py"
+ROOT = Path(__file__).parents[1]
+SCRIPT = ROOT / "scripts/create_rgbd_samples.py"
 SPEC = importlib.util.spec_from_file_location("create_rgbd_samples", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
-COMPARISON_SCRIPT = Path(__file__).parents[1] / "scripts/create_rgbd_comparisons.py"
-COMPARISON_SPEC = importlib.util.spec_from_file_location(
-    "create_rgbd_comparisons", COMPARISON_SCRIPT
-)
-COMPARISON = importlib.util.module_from_spec(COMPARISON_SPEC)
-COMPARISON_SPEC.loader.exec_module(COMPARISON)
 
 
-class SampleProtocolTest(unittest.TestCase):
-    @staticmethod
-    def _varint(value):
-        result = bytearray()
-        while value > 0x7F:
-            result.append((value & 0x7F) | 0x80)
-            value >>= 7
-        result.append(value)
-        return bytes(result)
-
-    @classmethod
-    def _field(cls, number, value):
-        return cls._varint(number << 3 | 2) + cls._varint(len(value)) + value
-
-    @classmethod
-    def _example(cls):
-        def feature(name, kind, payload):
-            value = cls._field(kind, cls._field(1, payload))
-            return cls._field(1, cls._field(1, name.encode()) + cls._field(2, value))
-
-        features = b"".join(
-            (
-                feature("bytes", 1, b"jpeg"),
-                feature("floats", 2, struct.pack("<2f", 1.25, -2.5)),
-                feature("ints", 3, cls._varint(3) + cls._varint(9)),
-            )
-        )
-        return cls._field(1, features)
-
-    def test_tf_example_tfrecord_and_ordinal_location(self):
-        example = self._example()
-        length = struct.pack("<Q", len(example))
-        tfrecord = (
-            length
-            + struct.pack("<L", MODULE._masked_crc32c(length))
-            + example
-            + struct.pack("<L", MODULE._masked_crc32c(example))
-        )
-        rows = list(MODULE.tfrecord_examples(tfrecord))
-        self.assertEqual(rows[0][3]["bytes"], [b"jpeg"])
-        self.assertTrue(np.allclose(rows[0][3]["floats"], [1.25, -2.5]))
-        self.assertEqual(rows[0][3]["ints"], [3, 9])
-        self.assertEqual(MODULE.ordinal_to_shard(0, [2, 3]), (0, 0))
-        self.assertEqual(MODULE.ordinal_to_shard(4, [2, 3]), (1, 2))
-
-    def test_unique_action_alignment_and_noise_coverage(self):
-        full = np.array([[0.0], [1.0], [2.0], [3.0]])
-        mask = MODULE.unique_subsequence_mask(full, full[[1, 3]])
-        self.assertEqual(mask.tolist(), [False, True, False, True])
-        self.assertIsNone(
-            MODULE.unique_subsequence_mask(np.array([[0.0], [1.0], [1.0], [2.0]]), np.array([[1.0], [2.0]]))
-        )
-        algorithms = [
-            MODULE.NOISE_ORDER[(MODULE.SUITES.index(suite) * 3 + slot - 1) % 5]
-            for suite in MODULE.SUITES
-            for slot in (1, 2, 3)
-        ]
-        self.assertTrue(all(algorithms.count(name) >= 2 for name in MODULE.NOISE_ORDER))
-
-    def test_duplicate_action_multimap_and_disambiguation(self):
-        actions = np.array([[1.0] * 7, [2.0] * 7], dtype=np.float32)
-        states = np.array([[3.0] * 8, [4.0] * 8], dtype=np.float32)
-        key = MODULE.action_key(actions)
-        targets = {
-            key: [
-                {"episode_index": 1, "suite": "s", "task": "t", "actions": actions, "states": states},
-                {"episode_index": 2, "suite": "s", "task": "t", "actions": actions, "states": states},
-            ]
-        }
-        self.assertEqual(len(targets[key]), 2)
-        record = {
-            "action_key": key,
-            "actions": actions,
-            "states": states,
-            "frame_sha256": ["rgb"],
-            "rgb_signatures": [np.zeros((32, 32, 3), dtype=np.uint8)] * 3,
-        }
-        selected = {"suite": "s", "task": "t"}
-        matched = MODULE._match_reordered(
-            record,
-            targets,
-            selected,
-            lambda target: [
-                np.zeros((32, 32, 3), dtype=np.uint8)
-                if target["episode_index"] == 2
-                else np.full((32, 32, 3), 100, dtype=np.uint8)
-            ]
-            * 3,
-        )
-        self.assertEqual(matched[0]["episode_index"], 2)
-        self.assertIn("RGB", matched[1])
-        self.assertIsNone(
-            MODULE._match_reordered(
-                record,
-                targets,
-                selected,
-                lambda target: [np.zeros((32, 32, 3), dtype=np.uint8)] * 3,
-            )
-        )
-        env_record = {
-            "first_mask": np.array([[0, 1, 9, 10]], dtype=np.uint8),
-            "object_map": {"task_object": 1},
-        }
-        self.assertEqual(MODULE._path_settings("/env/suite/demo.hdf5", env_record), ("objects", "background"))
-        self.assertEqual(env_record["extra_objects"], 2)
-
-    def test_stable_split_probe_ranking_and_numeric_report(self):
-        rows = [
-            {"reference_id": f"r{index}", "logical_episode": f"e{index}"}
-            for index in range(8)
-        ]
-        first = MODULE.stable_reference_split(rows)
-        second = MODULE.stable_reference_split(list(reversed(rows)))
-        self.assertEqual(first, second)
-        self.assertEqual([row["split"] for row in first].count("calibration"), 6)
-        self.assertFalse(
-            {row["logical_episode"] for row in first if row["split"] == "calibration"}
-            & {row["logical_episode"] for row in first if row["split"] == "holdout"}
-        )
-        probes = [
-            {"candidate_id": "b", "status": "valid", "loss": 1.0},
-            {"candidate_id": "a", "status": "valid", "loss": 1.0},
-            {"candidate_id": "c", "status": "invalid", "loss": 0.0},
-        ]
-        self.assertEqual([row["candidate_id"] for row in MODULE.rank_probes(probes)], ["a", "b"])
-        rescored = MODULE.rescore_probe(
-            {"candidate_id": "cached", "status": "valid", "loss": 999, "feature": {"numeric": [1], "categories": []}},
-            {"numeric": [2], "categories": []},
-            [{"numeric": [0], "categories": []}, {"numeric": [4], "categories": []}],
-        )
-        self.assertNotEqual(rescored["loss"], 999)
-        self.assertNotIn("unavailable", inspect.getsource(MODULE.write_gap_report))
-
-    def test_official_camera_axes_and_signed_pose_feature(self):
-        angle = np.deg2rad(30)
-        positive = np.eye(4)
-        positive[:3, :3] = [
-            [np.cos(angle), -np.sin(angle), 0],
-            [np.sin(angle), np.cos(angle), 0],
-            [0, 0, 1],
-        ]
-        positive[1, 3] = 0.3
-        raw_official = positive.copy()
-        raw_official[:3, 1:3] *= -1
-        self.assertTrue(np.allclose(MODULE.official_camera_pose(raw_official), positive))
-
-        negative = np.eye(4)
-        negative[:3, :3] = positive[:3, :3].T
-        negative[1, 3] = -0.3
-        positive_feature = MODULE._pose_feature(positive, np.eye(4))["numeric"]
-        negative_feature = MODULE._pose_feature(negative, np.eye(4))["numeric"]
-        self.assertAlmostEqual(positive_feature[0], negative_feature[0])
-        self.assertAlmostEqual(positive_feature[1], negative_feature[1])
-        self.assertFalse(np.allclose(positive_feature[2:], negative_feature[2:]))
-
-        pose = MODULE.camera_pose_from_xml(
-            '<mujoco><worldbody><camera name="agentview" pos="1 0 1" quat="1 0 0 0"/></worldbody></mujoco>',
+def fake_audit():
+    tasks = []
+    for task_index in range(40):
+        multi_step = task_index % 3 == 0
+        stem = f"fake_task_{task_index:02d}"
+        tasks.append(
             {
-                "horizontal": 90,
-                "vertical": 0,
-                "scale": 1,
-                "endpoint_horizontal": 0,
-                "endpoint_vertical": 0,
-            },
+                "task_index": task_index,
+                "task": stem,
+                "suite": MODULE.SUITES[task_index // 10],
+                "task_stem": stem,
+                "canonical_language": "put x in y and close z" if multi_step else "put x in y",
+                "multi_step": multi_step,
+                "canonical_bddl": str(SCRIPT),
+                "canonical_bddl_sha256": "bddl-hash",
+                "source_file": f"/source/{stem}.hdf5",
+                "demos": [
+                    {
+                        "source_demo": "demo_0",
+                        "source_ordinal": task_index,
+                        "actions": 2,
+                        "saved_frames": 1,
+                        "action_sha256": f"action-{task_index}",
+                        "keep_mask_sha256": f"mask-{task_index}",
+                        "source_model_xml_sha256": f"xml-{task_index}",
+                    }
+                ],
+            }
         )
-        self.assertTrue(np.allclose(pose[:3, 3], [0, 1, 1]))
+    return {"source_demo_count": 40, "tasks": tasks}
+
+
+def fake_languages(audit):
+    result = {"tasks": {}}
+    for task in audit["tasks"]:
+        subtypes = {}
+        for subtype in MODULE.SUBDIMENSIONS["language"]:
+            if subtype == "R3" and not task["multi_step"]:
+                continue
+            subtypes[subtype] = [
+                {
+                    "candidate_id": f"{subtype.lower()}-{index}",
+                    "instruction": f"{subtype} rewrite {index} for {task['task_stem']}",
+                    "prompt": f"prompt {subtype} {index}",
+                    "prompt_hash": f"prompt-{subtype}-{index}",
+                    "model_hash": "qwen-hash",
+                }
+                for index in range(1, 4)
+            ]
+        result["tasks"][task["task_stem"]] = subtypes
+    return result
+
+
+def fake_bddl_candidates(task, setting, subtype, source_ordinal):
+    rows = []
+    for index in range(1, 4):
+        row = {
+            "candidate_id": f"{setting}-{subtype}-{index}",
+            "bddl": str(SCRIPT),
+            "bddl_sha256": f"bddl-{index}",
+            "problem": f"problem-{index}",
+            "benchmark_bddl_excluded": True,
+        }
+        if setting == "objects":
+            row["extra_objects"] = source_ordinal % 3 + 1
+        elif setting == "background":
+            row["variant"] = "scene_and_surface" if subtype == "B1" else "surface_only"
+        else:
+            row["required_xml_field"] = MODULE.LIGHT_FIELDS[subtype]
+        rows.append(row)
+    return rows
+
+
+def build_rows():
+    audit = fake_audit()
+    with mock.patch.object(MODULE, "task_test_names", return_value=[]), mock.patch.object(
+        MODULE, "language_test_texts", return_value=set()
+    ), mock.patch.object(MODULE, "_bddl_candidates", side_effect=fake_bddl_candidates):
+        return MODULE.build_manifest_rows(audit, fake_languages(audit))
+
+
+class ReplicaProtocolTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rows = build_rows()
+
+    def test_manifest_is_six_jobs_per_source_and_covers_all_mechanisms(self):
+        MODULE.validate_manifest_rows(self.rows, 40)
+        self.assertEqual(len(self.rows), 240)
+        grouped = {}
+        for row in self.rows:
+            grouped.setdefault((row["task_index"], row["source_demo"]), set()).add(row["setting"])
+        self.assertTrue(all(settings == set(MODULE.SETTINGS) for settings in grouped.values()))
+        self.assertEqual(
+            {code for row in self.rows for code in row["subdimensions"]},
+            {code for values in MODULE.SUBDIMENSIONS.values() for code in values},
+        )
         self.assertTrue(
-            np.allclose(
-                pose[:3, :3],
-                np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]) @ np.diag([1, -1, -1]),
-                atol=1e-4,
+            all(
+                candidate["roll_deg"] != 0
+                for row in self.rows
+                if row["subdimensions"] == ["C3"]
+                for candidate in row["candidates"]
             )
         )
-
-    def test_comparison_requires_the_same_action_fingerprint(self):
-        actions = np.arange(21, dtype=np.float32).reshape(3, 7)
-        self.assertEqual(COMPARISON.exact_action_error(actions, actions.astype(np.float64)), 0)
-        changed = actions.copy()
-        changed[1, 2] += 1
-        with self.assertRaisesRegex(COMPARISON.base.AuditError, "same float32 fingerprint"):
-            COMPARISON.exact_action_error(actions, changed)
-
-        mirror = {
-            "setting": "camera",
-            "suite": "libero_spatial",
-            "variant_slot": 1,
-            "task": "task",
-            "action_key": MODULE.action_key(actions),
-        }
-        wrong = {
-            "setting": "camera",
-            "suite": "libero_spatial",
-            "mapped_task": "task",
-            "action_length": 3,
-            "action_sha256": MODULE.action_key(changed)[1],
-            "reference_id": "wrong",
-        }
-        exact = {**wrong, "action_sha256": MODULE.action_key(actions)[1], "reference_id": "exact"}
-        selected = COMPARISON.select_reference_matches([mirror], [wrong, exact])
-        self.assertEqual(selected["camera"][1]["reference_id"], "exact")
-
-        import cv2
-
-        rgb = np.array(
-            [
-                [[255, 0, 0], [0, 255, 0]],
-                [[0, 0, 255], [255, 255, 0]],
-            ],
-            dtype=np.uint8,
+        self.assertTrue(
+            all(row["multi_step"] for row in self.rows if row["subdimensions"] == ["R3"])
         )
-        ok, encoded = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        self.assertTrue(ok)
-        self.assertTrue(np.array_equal(COMPARISON.decode_rgb(encoded.tobytes()), rgb[::-1, ::-1]))
 
-    def test_manifest_rejects_non_diverse_official_language_before_replay(self):
-        import h5py
-        import json
-        import tempfile
+    def test_language_variants_remain_distinct_when_qwen_repeats_a_rewrite(self):
+        repeated = "place the condiment container in the woven receptacle"
+        rewrites = {
+            MODULE.enforce_variant_prefix(repeated, variant)
+            for variant in MODULE.LANGUAGE_VARIANTS["R2"][:3]
+        }
+        self.assertEqual(len(rewrites), 3)
+
+    def test_manifest_excludes_benchmark_candidates_and_partitions_exactly(self):
+        for row in self.rows:
+            for candidate in row["candidates"]:
+                if row["setting"] in {"objects", "background", "light"}:
+                    self.assertTrue(candidate["benchmark_bddl_excluded"])
+                elif row["setting"] == "camera":
+                    self.assertFalse(candidate["benchmark_tuple_equal"])
+                    self.assertGreaterEqual(candidate["min_test_distance"], 5)
+                elif row["setting"] == "language":
+                    self.assertTrue(candidate["benchmark_language_excluded"])
+                elif row["setting"] == "noise":
+                    self.assertFalse(candidate["benchmark_tuple_equal"])
+
+        partitions = [
+            {row["job_id"] for row in self.rows if row["task_index"] == task_index}
+            for task_index in range(40)
+        ]
+        self.assertTrue(all(len(partition) == 6 for partition in partitions))
+        self.assertEqual(sum(map(len, partitions)), len(set().union(*partitions)))
+        self.assertEqual(set().union(*partitions), {row["job_id"] for row in self.rows})
+
+    def test_smoke_selection_has_three_sources_per_suite_and_full_coverage(self):
+        rows = []
+        for index, ordinal in enumerate(MODULE.SMOKE_SOURCE_ORDINALS):
+            suite = MODULE.SUITES[index // 3]
+            for setting in MODULE.SETTINGS:
+                values = MODULE.SUBDIMENSIONS[setting]
+                rows.append(
+                    {
+                        "source_ordinal": ordinal,
+                        "suite": suite,
+                        "setting": setting,
+                        "subdimensions": [values[index % len(values)]],
+                    }
+                )
+        selected = MODULE.select_smoke_jobs(rows)
+        self.assertEqual(len(selected), 72)
+        self.assertEqual(
+            {code for row in selected for code in row["subdimensions"]},
+            {code for values in MODULE.SUBDIMENSIONS.values() for code in values},
+        )
+
+    def test_noop_mask_matches_the_twelve_v2_source_trajectories(self):
+        audit_path = ROOT / "data/libero_plus_rgbd_sample_v2/audit.json"
+        if not audit_path.is_file():
+            self.skipTest("v2 no-op regression evidence is not present")
+        audit = json.loads(audit_path.read_text())
+        checked = 0
+        for suite in audit["selected_tasks"].values():
+            source = suite["source"]
+            with h5py.File(source["source_file"], "r") as handle:
+                for selected in source["selected"]:
+                    actions = handle[f"data/{selected['source_demo']}/actions"][()]
+                    mask = MODULE.keep_action_mask(actions)
+                    self.assertEqual(mask.astype(int).tolist(), selected["keep_mask"])
+                    self.assertEqual(MODULE.sha256_bytes(mask.tobytes()), selected["keep_mask_sha256"])
+                    checked += 1
+        self.assertEqual(checked, 12)
+
+    def test_random_noise_is_reproducible_but_varies_by_timestep(self):
+        rng = np.random.default_rng(7)
+        image = rng.integers(0, 256, (MODULE.IMAGE_SIZE, MODULE.IMAGE_SIZE, 3), dtype=np.uint8)
+        for subtype in ("N1", "N4", "N5"):
+            candidate = MODULE.noise_candidates(subtype, 7, 11)[0]
+            first_seed = MODULE.stable_seed(123, 4)
+            second_seed = MODULE.stable_seed(123, 5)
+            first = MODULE.apply_noise(image, candidate, first_seed)
+            self.assertTrue(np.array_equal(first, MODULE.apply_noise(image, candidate, first_seed)))
+            self.assertFalse(np.array_equal(first, MODULE.apply_noise(image, candidate, second_seed)))
+            if subtype == "N5":
+                one_iteration = json.loads(json.dumps(candidate))
+                one_iteration["parameters"]["iterations"] = 1
+                self.assertFalse(
+                    np.array_equal(first, MODULE.apply_noise(image, one_iteration, first_seed))
+                )
+
+    def test_camera_pose_is_episode_static_and_c3_has_roll(self):
+        class Model:
+            cam_pos = np.array([[1.0, 0.0, 1.0]])
+            cam_quat = np.array([[1.0, 0.0, 0.0, 0.0]])
+
+            @staticmethod
+            def camera_name2id(name):
+                return 0
+
+        class Sim:
+            model = Model()
+
+            @staticmethod
+            def forward():
+                pass
+
+        class Env:
+            sim = Sim()
+
+        for subtype in MODULE.SUBDIMENSIONS["camera"]:
+            env = Env()
+            candidate = MODULE.camera_candidates(subtype, [], 13)[0]
+            MODULE.apply_camera_perturbation(env, candidate)
+            poses = [(env.sim.model.cam_pos.copy(), env.sim.model.cam_quat.copy()) for _ in range(4)]
+            self.assertTrue(all(np.array_equal(poses[0][0], pose[0]) for pose in poses[1:]))
+            self.assertTrue(all(np.array_equal(poses[0][1], pose[1]) for pose in poses[1:]))
+            if subtype == "C3":
+                self.assertGreaterEqual(abs(candidate["roll_deg"]), 2)
+
+    def test_failed_episode_does_not_stop_later_jobs_and_resume_skips_terminals(self):
+        rows = []
+        for index in range(2):
+            rows.append(
+                {
+                    "job_id": f"job-{index}",
+                    "task_index": 0,
+                    "output_path": f"episodes/task-00/job-{index}.hdf5",
+                    "candidates": [
+                        {"candidate_index": candidate, "candidate_id": f"c{candidate}"}
+                        for candidate in range(1, 4)
+                    ],
+                }
+            )
+        successful = set()
+        calls = []
+
+        def valid(path, row):
+            return row["job_id"] in successful
+
+        def attempt(row, candidate, output, runtime, gpu):
+            calls.append((row["job_id"], candidate["candidate_index"]))
+            if row["job_id"] == "job-0":
+                raise MODULE.AttemptFailure("expected failure")
+            successful.add(row["job_id"])
+            return {"job_id": row["job_id"]}
 
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
-            rows = [
-                {
-                    "reference_id": f"ref-{index}",
-                    "suite": "libero_spatial",
-                    "setting": "language",
-                    "split": "calibration" if index < 6 else "holdout",
-                    "confidence": "high",
-                }
-                for index in range(8)
-            ]
-            MODULE.atomic_jsonl(output / "evidence/reference_mapping.jsonl", rows)
-            with h5py.File(output / "evidence/official_references.hdf5", "w") as handle:
-                for row in rows:
-                    group = handle.create_group(row["reference_id"])
-                    group.create_dataset("first_rgb", data=np.zeros((2, 2, 3), dtype=np.uint8))
-                    MODULE.text_dataset(group, "object_map_json", "{}")
-                    MODULE.text_dataset(group, "language", "same text")
-            with self.assertRaisesRegex(MODULE.AuditError, "language diversity"):
-                MODULE.load_reference_features(output, {}, 0)
-            report = json.loads((output / "reports/calibration.json").read_text())
-            self.assertEqual(report["decision"], "NO-GO")
-            self.assertEqual(report["language_text_diversity"]["libero_spatial"]["calibration"], 1)
-            languages = {
-                "libero_spatial": [
-                    {"candidate_id": f"language-{index + 1}", "instruction": f"rewrite {index + 1}"}
-                    for index in range(8)
-                ]
-            }
-            features = MODULE.load_reference_features(output, {}, 0, languages)
-            self.assertEqual(
-                len({item["language"] for item in features[("libero_spatial", "language")]}), 8
+            MODULE.atomic_jsonl(output / "manifest.jsonl", rows)
+            args = argparse.Namespace(output=output, task_index=0, gpu=0, smoke_only=False)
+            patches = (
+                mock.patch.object(MODULE, "validate_manifest_rows"),
+                mock.patch.object(MODULE, "configure_libero"),
+                mock.patch.object(MODULE, "runtime_metadata", return_value={}),
+                mock.patch.object(MODULE, "episode_structurally_valid", side_effect=valid),
+                mock.patch.object(MODULE, "run_attempt_isolated", side_effect=attempt),
             )
-            self.assertTrue(
-                all(
-                    item["reference_source"].startswith("qwen-fallback:")
-                    for item in features[("libero_spatial", "language")]
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                MODULE.generate(args)
+                first_calls = list(calls)
+                MODULE.generate(args)
+            self.assertEqual(first_calls, [("job-0", 1), ("job-0", 2), ("job-0", 3), ("job-1", 1)])
+            self.assertEqual(calls, first_calls)
+            ledger = MODULE.read_jsonl(output / "attempts/task-00.jsonl")
+            self.assertEqual(sum(row["status"] == "failed" for row in ledger), 3)
+            self.assertEqual(sum(row["status"] == "rejected" for row in ledger), 1)
+            self.assertEqual(sum(row["status"] == "success" for row in ledger), 1)
+
+    def test_generated_document_uses_coverage_and_retention_counts(self):
+        coverage_rows = []
+        for setting in MODULE.SETTINGS:
+            for code in MODULE.SUBDIMENSIONS[setting]:
+                coverage_rows.append(
+                    {
+                        "setting": setting,
+                        "subdimension": code,
+                        "jobs": 4,
+                        "attempts": 5,
+                        "success": 3,
+                        "rejected": 1,
+                        "retention_rate": 0.75,
+                        "parameters": {"proof": code},
+                        "example": f"episodes/{code}.hdf5",
+                    }
                 )
-            )
+        coverage = {"generated_at": "2026-08-05T00:00:00Z", "subdimensions": coverage_rows}
+        retention = {
+            "jobs": 72,
+            "candidate_attempts": 90,
+            "success": 54,
+            "rejected": 18,
+            "pending": 0,
+            "retention_rate": 0.75,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            MODULE.atomic_json(output / "protocol.json", MODULE.protocol())
+            MODULE.atomic_jsonl(output / "manifest.jsonl", self.rows)
+            MODULE.atomic_json(output / "coverage.json", coverage)
+            MODULE.atomic_json(output / "retention.json", retention)
+            MODULE.write_perturbations_doc(output, coverage, retention, "manifest-hash")
+            document = (output / "PERTURBATIONS.md").read_text()
+            self.assertIn("- Jobs: `72`", document)
+            self.assertIn("- Successful episodes: `54`", document)
+            self.assertIn("- Rejected episodes: `18`", document)
+            for code in {item["subdimension"] for item in coverage_rows}:
+                self.assertIn(f" / {code} |", document)
 
 
 if __name__ == "__main__":
